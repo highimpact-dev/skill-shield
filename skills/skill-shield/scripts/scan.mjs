@@ -47,6 +47,21 @@ const THREAT_PATTERNS = {
         description: "Hidden instructions in HTML/markdown comments",
       },
       {
+        name: "hidden_command_in_comment",
+        regex: /<!--[\s\S]*?(curl|wget|bash|sh\s|python|node\s|eval|exec|fetch|nc\s|ncat|socat|ssh|scp|rsync)[\s\S]*?-->/i,
+        description: "Executable command hidden in HTML/markdown comment",
+      },
+      {
+        name: "pipe_to_shell",
+        regex: /(curl|wget|fetch)\s+[^\n]*\|\s*(bash|sh|zsh|python|node|ruby|perl|exec)/i,
+        description: "Fetching remote content and piping to shell execution",
+      },
+      {
+        name: "backtick_command_in_comment",
+        regex: /<!--[\s\S]*?`[^`]*(curl|wget|bash|rm|eval|exec|python|node)[^`]*`[\s\S]*?-->/i,
+        description: "Backtick-wrapped command hidden in HTML comment",
+      },
+      {
         name: "unicode_homoglyph_obfuscation",
         regex: /[\u200B-\u200F\u2028-\u202F\u2060-\u206F\uFEFF]/,
         description: "Zero-width or invisible Unicode characters (obfuscation)",
@@ -337,17 +352,27 @@ function collectFiles(dir, maxDepth = 5, currentDepth = 0) {
 
 // ─── Scanning ─────────────────────────────────────────────────────────────────
 
+// Patterns that need multi-line matching (HTML comments spanning multiple lines)
+const MULTILINE_PATTERNS = new Set([
+  "hidden_instruction_markdown",
+  "hidden_command_in_comment",
+  "backtick_command_in_comment",
+]);
+
 function scanFile(filePath, content) {
   const findings = [];
   const lines = content.split("\n");
+  const foundPatterns = new Set();
 
+  // Pass 1: line-by-line scanning
   for (const [categoryKey, category] of Object.entries(THREAT_PATTERNS)) {
     for (const pattern of category.patterns) {
+      if (MULTILINE_PATTERNS.has(pattern.name)) continue; // handled in pass 2
       for (let i = 0; i < lines.length; i++) {
         const line = lines[i];
         if (pattern.regex.test(line)) {
-          // Reset regex lastIndex for stateful regexes
           pattern.regex.lastIndex = 0;
+          foundPatterns.add(pattern.name);
           findings.push({
             category: category.category,
             categoryKey,
@@ -360,6 +385,31 @@ function scanFile(filePath, content) {
           });
           break; // one finding per pattern per file
         }
+      }
+    }
+  }
+
+  // Pass 2: multi-line scanning (for patterns that span lines, e.g. HTML comments)
+  for (const [categoryKey, category] of Object.entries(THREAT_PATTERNS)) {
+    for (const pattern of category.patterns) {
+      if (!MULTILINE_PATTERNS.has(pattern.name)) continue;
+      if (foundPatterns.has(pattern.name)) continue;
+      pattern.regex.lastIndex = 0;
+      if (pattern.regex.test(content)) {
+        pattern.regex.lastIndex = 0;
+        // Find approximate line number by searching for comment start
+        const match = content.match(/<!--/);
+        const lineNum = match ? content.substring(0, match.index).split("\n").length : 1;
+        findings.push({
+          category: category.category,
+          categoryKey,
+          severity: category.severity,
+          pattern: pattern.name,
+          description: pattern.description,
+          file: filePath,
+          line: lineNum,
+          content: content.substring(match?.index || 0, (match?.index || 0) + 200).replace(/\n/g, " ").trim(),
+        });
       }
     }
   }
