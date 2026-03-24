@@ -3,224 +3,114 @@ name: Skill Shield CI
 on:
   pull_request:
     paths:
-      - 'skills/**'
-      - 'marketplace/skills/**'
+      - "skills/**"
+      - "marketplace/skills/**"
 
 permissions:
   contents: read
   pull-requests: write
-  issues: write
 
 jobs:
   scan:
     name: Scan Changed Skills
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout PR
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Setup Node
-        uses: actions/setup-node@v4
+      - uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: "22"
 
-      - name: Get changed skill directories
-        id: changed-skills
+      - name: Detect changed skills
+        id: detect
         run: |
-          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- 'skills/**' 'marketplace/skills/**' | \
-            grep -E '^(skills/|marketplace/skills/)' | \
-            while IFS= read -r file; do
-              # Extract the skill directory (first two path segments for skills/, first three for marketplace/skills/)
-              if echo "$file" | grep -q '^marketplace/skills/'; then
-                echo "$file" | awk -F/ '{print $1"/"$2"/"$3}'
-              else
-                echo "$file" | awk -F/ '{print $1"/"$2}'
-              fi
-            done | sort -u)
+          DIRS=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- 'skills/' 'marketplace/skills/' | \
+            sed -E 's|^(marketplace/skills/[^/]+|skills/[^/]+)/.*|\1|' | sort -u | tr '\n' ' ')
+          echo "dirs=$DIRS" >> "$GITHUB_OUTPUT"
+          echo "Found: $DIRS"
 
-          if [ -z "$CHANGED" ]; then
-            echo "No skill directories changed."
-            echo "skills=" >> $GITHUB_OUTPUT
-            exit 0
-          fi
-
-          EXISTING=""
-          for dir in $CHANGED; do
-            if [ -d "$dir" ]; then
-              EXISTING="$EXISTING $dir"
-            fi
-          done
-
-          echo "skills=$EXISTING" >> $GITHUB_OUTPUT
-          echo "Changed skill directories: $EXISTING"
-
-      - name: Run skill-shield on changed skills
-        if: steps.changed-skills.outputs.skills != ''
-        id: scan-results
+      - name: Scan skills
+        if: steps.detect.outputs.dirs != ''
+        id: scan
         run: |
-          SKILLS="${{ steps.changed-skills.outputs.skills }}"
-          SCANNER="skills/skill-shield/scripts/scan.mjs"
+          PASS=true
+          LOWEST=100
           REPORT=""
-          OVERALL_PASS=true
-          LOWEST_SCORE=100
-
-          for SKILL_DIR in $SKILLS; do
-            SKILL_NAME=$(basename "$SKILL_DIR")
-            echo "::group::Scanning $SKILL_NAME"
-
-            JSON=$(node "$SCANNER" "$SKILL_DIR" 2>&1)
+          for DIR in ${{ steps.detect.outputs.dirs }}; do
+            [ ! -d "$DIR" ] && continue
+            NAME=$(basename "$DIR")
+            JSON=$(node skills/skill-shield/scripts/scan.mjs "$DIR")
             SCORE=$(echo "$JSON" | jq -r '.trustScore')
             GRADE=$(echo "$JSON" | jq -r '.grade')
             LABEL=$(echo "$JSON" | jq -r '.gradeLabel')
-            TOTAL=$(echo "$JSON" | jq -r '.summary.totalFindings')
-            CRITICAL=$(echo "$JSON" | jq -r '.summary.critical')
+            COUNT=$(echo "$JSON" | jq -r '.summary.totalFindings')
+            CRIT=$(echo "$JSON" | jq -r '.summary.critical')
             HIGH=$(echo "$JSON" | jq -r '.summary.high')
-            MEDIUM=$(echo "$JSON" | jq -r '.summary.medium')
-
-            echo "Score: $SCORE/100 Grade: $GRADE ($LABEL)"
-            echo "Findings: $TOTAL (critical: $CRITICAL, high: $HIGH, medium: $MEDIUM)"
-
-            # Build findings list
-            FINDINGS_LIST=""
-            FINDING_COUNT=$(echo "$JSON" | jq '.findings | length')
-            for i in $(seq 0 $((FINDING_COUNT - 1))); do
-              SEV=$(echo "$JSON" | jq -r ".findings[$i].severity" | tr '[:lower:]' '[:upper:]')
-              PAT=$(echo "$JSON" | jq -r ".findings[$i].pattern")
-              FILE=$(echo "$JSON" | jq -r ".findings[$i].file")
-              LINE=$(echo "$JSON" | jq -r ".findings[$i].line")
-              DESC=$(echo "$JSON" | jq -r ".findings[$i].description")
-              FINDINGS_LIST="${FINDINGS_LIST}
-- **[$SEV]** \`$PAT\` — $FILE:$LINE — $DESC"
-            done
-
-            if [ -z "$FINDINGS_LIST" ]; then
-              FINDINGS_LIST="No issues found."
-            fi
-
-            # Track lowest score
-            if [ "$SCORE" -lt "$LOWEST_SCORE" ]; then
-              LOWEST_SCORE=$SCORE
-            fi
-
-            # Determine pass/fail
+            MED=$(echo "$JSON" | jq -r '.summary.medium')
+            FLIST=$(echo "$JSON" | jq -r '.findings[] | "- [\(.severity | ascii_upcase)] \(.pattern) -- \(.file):\(.line)"')
+            [ -z "$FLIST" ] && FLIST="No issues found."
+            [ "$SCORE" -lt "$LOWEST" ] && LOWEST=$SCORE
             if [ "$SCORE" -lt 50 ]; then
-              OVERALL_PASS=false
+              PASS=false
+              BADGE="X"
               STATUS="BLOCKED"
-              BADGE="🔴"
             elif [ "$SCORE" -lt 75 ]; then
+              BADGE="!"
               STATUS="CAUTION"
-              BADGE="🟡"
             else
+              BADGE="OK"
               STATUS="VERIFIED"
-              BADGE="🟢"
             fi
-
             REPORT="$REPORT
-### $BADGE \`$SKILL_NAME\` — Grade $GRADE ($SCORE/100) — $LABEL
-
-**Status**: $STATUS
-
-**Findings** ($TOTAL total: $CRITICAL critical, $HIGH high, $MEDIUM medium):
-$FINDINGS_LIST
-
----"
-            echo "::endgroup::"
+          ### [$BADGE] $NAME - Grade $GRADE ($SCORE/100) - $LABEL
+          **Status**: $STATUS
+          **Findings** ($COUNT total: $CRIT critical, $HIGH high, $MED medium):
+          $FLIST
+          ---"
+            echo "$NAME: $SCORE/100 ($GRADE)"
           done
+          echo "$REPORT" > /tmp/report.txt
+          echo "pass=$PASS" >> "$GITHUB_OUTPUT"
+          echo "lowest=$LOWEST" >> "$GITHUB_OUTPUT"
 
-          # Write report for next step
-          echo "$REPORT" > /tmp/scan-report.txt
-          echo "overall_pass=$OVERALL_PASS" >> $GITHUB_OUTPUT
-          echo "lowest_score=$LOWEST_SCORE" >> $GITHUB_OUTPUT
-
-      - name: Post trust report as PR comment
-        if: steps.changed-skills.outputs.skills != ''
+      - name: Post PR comment
+        if: steps.detect.outputs.dirs != ''
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const report = fs.readFileSync('/tmp/scan-report.txt', 'utf8');
-            const overallPass = '${{ steps.scan-results.outputs.overall_pass }}' === 'true';
-            const lowestScore = parseInt('${{ steps.scan-results.outputs.lowest_score }}') || 0;
-
-            const header = overallPass
-              ? '## Skill Shield CI — All Skills Verified ✅'
-              : '## Skill Shield CI — Merge Blocked 🚫';
-
-            const summary = overallPass
-              ? `All changed skills passed the security gate (lowest score: ${lowestScore}/100).`
-              : `One or more skills scored below 50/100 (grade D or F). Merge is blocked until issues are resolved.`;
-
-            const body = `${header}\n\n${summary}\n\n---\n\n${report}\n\n<sub>Scanned by <a href="https://github.com/highimpact-dev/skill-shield">skill-shield</a></sub>`;
-
+            const report = fs.readFileSync('/tmp/report.txt', 'utf8');
+            const pass = '${{ steps.scan.outputs.pass }}' === 'true';
+            const lowest = '${{ steps.scan.outputs.lowest }}';
+            const header = pass
+              ? '## Skill Shield CI - All Skills Verified'
+              : '## Skill Shield CI - Merge Blocked';
+            const summary = pass
+              ? `All skills passed (lowest: ${lowest}/100).`
+              : 'One or more skills scored below 50. Merge blocked.';
+            const body = `${header}\n\n${summary}\n\n---\n${report}\n\n_Scanned by [skill-shield](https://github.com/highimpact-dev/skill-shield)_`;
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
             });
-
-            const existing = comments.find(c =>
-              c.user.type === 'Bot' && c.body.includes('Skill Shield CI')
-            );
-
+            const existing = comments.find(c => c.user.type === 'Bot' && c.body.includes('Skill Shield CI'));
             if (existing) {
               await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: existing.id,
-                body,
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
               });
             } else {
               await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body,
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
               });
             }
 
-      - name: Add shield-verified label on pass
-        if: steps.changed-skills.outputs.skills != '' && steps.scan-results.outputs.overall_pass == 'true'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            try {
-              await github.rest.issues.createLabel({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                name: 'shield-verified',
-                color: '0e8a16',
-                description: 'All skills in this PR passed the skill-shield security scan',
-              });
-            } catch (e) {}
-
-            await github.rest.issues.addLabels({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              labels: ['shield-verified'],
-            });
-
-      - name: Remove shield-verified label on failure
-        if: steps.changed-skills.outputs.skills != '' && steps.scan-results.outputs.overall_pass == 'false'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            try {
-              await github.rest.issues.removeLabel({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                name: 'shield-verified',
-              });
-            } catch (e) {}
-
-      - name: Fail if trust score below gate
-        if: steps.changed-skills.outputs.skills != '' && steps.scan-results.outputs.overall_pass == 'false'
+      - name: Gate check
+        if: steps.detect.outputs.dirs != '' && steps.scan.outputs.pass == 'false'
         run: |
-          echo "❌ One or more skills scored below the merge gate (50/100)."
-          echo "Fix the flagged patterns or document legitimate use in your SKILL.md frontmatter."
-          echo "See CONTRIBUTING.md for guidance."
+          echo "Merge blocked: skill(s) scored below 50/100."
           exit 1
