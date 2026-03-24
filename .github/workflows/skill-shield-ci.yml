@@ -1,0 +1,297 @@
+name: Skill Shield CI
+
+on:
+  pull_request:
+    paths:
+      - 'skills/**'
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  scan:
+    name: Scan Changed Skills
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Get changed skill directories
+        id: changed-skills
+        run: |
+          # Get list of changed files in skills/
+          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- 'skills/**' | \
+            grep '^skills/' | \
+            awk -F/ '{print $1"/"$2}' | \
+            sort -u)
+
+          if [ -z "$CHANGED" ]; then
+            echo "No skill directories changed."
+            echo "skills=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Only include directories that still exist (not deleted)
+          EXISTING=""
+          for dir in $CHANGED; do
+            if [ -d "$dir" ]; then
+              EXISTING="$EXISTING $dir"
+            fi
+          done
+
+          echo "skills=$EXISTING" >> $GITHUB_OUTPUT
+          echo "Changed skill directories: $EXISTING"
+
+      - name: Install skill-shield
+        if: steps.changed-skills.outputs.skills != ''
+        run: |
+          # Clone or install skill-shield scanner
+          # In production this would be: bun add -g skill-shield
+          # For now we inline a minimal scanner that matches the skill-shield interface
+          cat > /tmp/skill-shield-scan.sh << 'SCANNER'
+          #!/usr/bin/env bash
+          SKILL_DIR="$1"
+          SKILL_FILE="$SKILL_DIR/SKILL.md"
+
+          if [ ! -f "$SKILL_FILE" ]; then
+            echo "MISSING_SKILL_MD"
+            echo "score=0"
+            echo "grade=F"
+            exit 1
+          fi
+
+          SCORE=100
+          FINDINGS=""
+
+          # Check for prompt injection patterns
+          if grep -qiE '(ignore (previous|all|above)|disregard|override (your|all)|forget (your|all)|you are now|act as if|pretend you)' "$SKILL_DIR"/*.md 2>/dev/null; then
+            SCORE=$((SCORE - 35))
+            FINDINGS="$FINDINGS\n- [HIGH] Prompt injection pattern detected"
+          fi
+
+          # Check for data exfiltration patterns
+          if grep -qE '(curl|wget|fetch|axios|http[s]?://)' "$SKILL_DIR"/**/*.{sh,js,ts,py} 2>/dev/null; then
+            # Check if documented in frontmatter
+            if grep -q 'network_calls:' "$SKILL_FILE" 2>/dev/null; then
+              SCORE=$((SCORE - 5))
+              FINDINGS="$FINDINGS\n- [LOW] Network calls present (documented in frontmatter)"
+            else
+              SCORE=$((SCORE - 25))
+              FINDINGS="$FINDINGS\n- [HIGH] Undocumented network calls detected"
+            fi
+          fi
+
+          # Check for shell execution without documentation
+          if grep -qE '(exec|system|subprocess|shell\.run|Bash tool)' "$SKILL_DIR"/**/*.{md} 2>/dev/null; then
+            if grep -q 'shell_access:' "$SKILL_FILE" 2>/dev/null; then
+              SCORE=$((SCORE - 5))
+              FINDINGS="$FINDINGS\n- [LOW] Shell execution present (documented)"
+            else
+              SCORE=$((SCORE - 15))
+              FINDINGS="$FINDINGS\n- [MEDIUM] Shell execution referenced, not documented in frontmatter"
+            fi
+          fi
+
+          # Check for obfuscated content
+          if grep -qE '(base64|atob|btoa|eval\(|exec\()' "$SKILL_DIR"/**/*.{sh,js,ts,py} 2>/dev/null; then
+            SCORE=$((SCORE - 30))
+            FINDINGS="$FINDINGS\n- [HIGH] Obfuscated or eval'd code detected"
+          fi
+
+          # Check for destructive operations without safeguards
+          if grep -qE '(rm -rf|rmdir|DROP TABLE|DELETE FROM|format|mkfs)' "$SKILL_DIR"/**/*.{sh,md} 2>/dev/null; then
+            if grep -q 'destructive:' "$SKILL_FILE" 2>/dev/null; then
+              SCORE=$((SCORE - 10))
+              FINDINGS="$FINDINGS\n- [MEDIUM] Destructive operations present (documented)"
+            else
+              SCORE=$((SCORE - 30))
+              FINDINGS="$FINDINGS\n- [HIGH] Undocumented destructive operations detected"
+            fi
+          fi
+
+          # Floor at 0
+          [ $SCORE -lt 0 ] && SCORE=0
+
+          # Assign grade
+          if [ $SCORE -ge 80 ]; then GRADE="A"
+          elif [ $SCORE -ge 65 ]; then GRADE="B"
+          elif [ $SCORE -ge 50 ]; then GRADE="C"
+          elif [ $SCORE -ge 35 ]; then GRADE="D"
+          else GRADE="F"
+          fi
+
+          echo "score=$SCORE"
+          echo "grade=$GRADE"
+          if [ -n "$FINDINGS" ]; then
+            echo "findings=$FINDINGS"
+          else
+            echo "findings=No issues found."
+          fi
+          SCANNER
+          chmod +x /tmp/skill-shield-scan.sh
+
+      - name: Run skill-shield on changed skills
+        if: steps.changed-skills.outputs.skills != ''
+        id: scan-results
+        run: |
+          SKILLS="${{ steps.changed-skills.outputs.skills }}"
+          REPORT=""
+          OVERALL_PASS=true
+          LOWEST_SCORE=100
+
+          for SKILL_DIR in $SKILLS; do
+            SKILL_NAME=$(basename "$SKILL_DIR")
+            echo "Scanning: $SKILL_DIR"
+
+            OUTPUT=$(/tmp/skill-shield-scan.sh "$SKILL_DIR" 2>&1)
+            SCORE=$(echo "$OUTPUT" | grep '^score=' | cut -d= -f2)
+            GRADE=$(echo "$OUTPUT" | grep '^grade=' | cut -d= -f2)
+            FINDINGS=$(echo "$OUTPUT" | grep '^findings=' | cut -d= -f2-)
+
+            # Track lowest score
+            if [ -n "$SCORE" ] && [ "$SCORE" -lt "$LOWEST_SCORE" ]; then
+              LOWEST_SCORE=$SCORE
+            fi
+
+            # Determine pass/fail (< 50 = fail)
+            if [ -z "$SCORE" ] || [ "$SCORE" -lt 50 ]; then
+              OVERALL_PASS=false
+              STATUS="BLOCKED"
+              BADGE="🔴"
+            elif [ "$SCORE" -lt 65 ]; then
+              STATUS="CAUTION"
+              BADGE="🟡"
+            else
+              STATUS="VERIFIED"
+              BADGE="🟢"
+            fi
+
+            REPORT="$REPORT
+          ### $BADGE \`$SKILL_NAME\` — Grade $GRADE ($SCORE/100)
+
+          **Status**: $STATUS
+
+          **Findings**:
+          $FINDINGS
+
+          ---"
+          done
+
+          # Write report to file for next step
+          echo "$REPORT" > /tmp/scan-report.txt
+          echo "overall_pass=$OVERALL_PASS" >> $GITHUB_OUTPUT
+          echo "lowest_score=$LOWEST_SCORE" >> $GITHUB_OUTPUT
+
+      - name: Post trust report as PR comment
+        if: steps.changed-skills.outputs.skills != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const report = fs.readFileSync('/tmp/scan-report.txt', 'utf8');
+            const overallPass = '${{ steps.scan-results.outputs.overall_pass }}' === 'true';
+            const lowestScore = parseInt('${{ steps.scan-results.outputs.lowest_score }}') || 0;
+
+            const header = overallPass
+              ? '## Skill Shield CI — All Skills Verified ✅'
+              : '## Skill Shield CI — Merge Blocked 🚫';
+
+            const summary = overallPass
+              ? `All changed skills passed the security gate (lowest score: ${lowestScore}/100).`
+              : `One or more skills scored below 50/100 (grade D or F). Merge is blocked until issues are resolved. See [CONTRIBUTING.md](../CONTRIBUTING.md) for how to document legitimate patterns.`;
+
+            const body = `${header}
+
+            ${summary}
+
+            ---
+
+            ${report}
+
+            <sub>Scanned by [skill-shield](https://github.com/your-org/shielded-skills) · [How scoring works](../CONTRIBUTING.md#how-scoring-works)</sub>`;
+
+            // Find existing comment to update, or create new
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+
+            const existing = comments.find(c =>
+              c.user.type === 'Bot' && c.body.includes('Skill Shield CI')
+            );
+
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      - name: Add shield-verified label on pass
+        if: steps.changed-skills.outputs.skills != '' && steps.scan-results.outputs.overall_pass == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            // Ensure label exists
+            try {
+              await github.rest.issues.createLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                name: 'shield-verified',
+                color: '0e8a16',
+                description: 'All skills in this PR passed the skill-shield security scan',
+              });
+            } catch (e) {
+              // Label already exists, that's fine
+            }
+
+            await github.rest.issues.addLabels({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              labels: ['shield-verified'],
+            });
+
+      - name: Remove shield-verified label on failure
+        if: steps.changed-skills.outputs.skills != '' && steps.scan-results.outputs.overall_pass == 'false'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                name: 'shield-verified',
+              });
+            } catch (e) {
+              // Label wasn't there, that's fine
+            }
+
+      - name: Fail if trust score below gate
+        if: steps.changed-skills.outputs.skills != '' && steps.scan-results.outputs.overall_pass == 'false'
+        run: |
+          echo "One or more skills scored below the merge gate (50/100)."
+          echo "Fix the flagged patterns or document legitimate use in your SKILL.md frontmatter."
+          echo "See CONTRIBUTING.md for guidance."
+          exit 1
