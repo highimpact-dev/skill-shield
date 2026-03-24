@@ -22,31 +22,24 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
+      - name: Setup Node
+        uses: actions/setup-node@v4
         with:
-          bun-version: latest
+          node-version: '22'
 
       - name: Get changed skill directories
         id: changed-skills
         run: |
-          # Get list of changed files in skills/ and marketplace/skills/
           CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- 'skills/**' 'marketplace/skills/**' | \
             grep -E '^(skills/|marketplace/skills/)' | \
-            sed 's|^marketplace/||' | \
-            awk -F/ '{print $1"/"$2}' | \
-            sort -u)
-
-          # Re-add marketplace/ prefix for dirs that came from there
-          RESOLVED=""
-          for dir in $CHANGED; do
-            if [ -d "$dir" ]; then
-              RESOLVED="$RESOLVED $dir"
-            elif [ -d "marketplace/$dir" ]; then
-              RESOLVED="$RESOLVED marketplace/$dir"
-            fi
-          done
-          CHANGED="$RESOLVED"
+            while IFS= read -r file; do
+              # Extract the skill directory (first two path segments for skills/, first three for marketplace/skills/)
+              if echo "$file" | grep -q '^marketplace/skills/'; then
+                echo "$file" | awk -F/ '{print $1"/"$2"/"$3}'
+              else
+                echo "$file" | awk -F/ '{print $1"/"$2}'
+              fi
+            done | sort -u)
 
           if [ -z "$CHANGED" ]; then
             echo "No skill directories changed."
@@ -54,7 +47,6 @@ jobs:
             exit 0
           fi
 
-          # Only include directories that still exist (not deleted)
           EXISTING=""
           for dir in $CHANGED; do
             if [ -d "$dir" ]; then
@@ -65,123 +57,60 @@ jobs:
           echo "skills=$EXISTING" >> $GITHUB_OUTPUT
           echo "Changed skill directories: $EXISTING"
 
-      - name: Install skill-shield
-        if: steps.changed-skills.outputs.skills != ''
-        run: |
-          # Clone or install skill-shield scanner
-          # In production this would be: bun add -g skill-shield
-          # For now we inline a minimal scanner that matches the skill-shield interface
-          cat > /tmp/skill-shield-scan.sh << 'SCANNER'
-          #!/usr/bin/env bash
-          SKILL_DIR="$1"
-          SKILL_FILE="$SKILL_DIR/SKILL.md"
-
-          if [ ! -f "$SKILL_FILE" ]; then
-            echo "MISSING_SKILL_MD"
-            echo "score=0"
-            echo "grade=F"
-            exit 1
-          fi
-
-          SCORE=100
-          FINDINGS=""
-
-          # Check for prompt injection patterns
-          if grep -qiE '(ignore (previous|all|above)|disregard|override (your|all)|forget (your|all)|you are now|act as if|pretend you)' "$SKILL_DIR"/*.md 2>/dev/null; then
-            SCORE=$((SCORE - 35))
-            FINDINGS="$FINDINGS\n- [HIGH] Prompt injection pattern detected"
-          fi
-
-          # Check for data exfiltration patterns
-          if grep -qE '(curl|wget|fetch|axios|http[s]?://)' "$SKILL_DIR"/**/*.{sh,js,ts,py} 2>/dev/null; then
-            # Check if documented in frontmatter
-            if grep -q 'network_calls:' "$SKILL_FILE" 2>/dev/null; then
-              SCORE=$((SCORE - 5))
-              FINDINGS="$FINDINGS\n- [LOW] Network calls present (documented in frontmatter)"
-            else
-              SCORE=$((SCORE - 25))
-              FINDINGS="$FINDINGS\n- [HIGH] Undocumented network calls detected"
-            fi
-          fi
-
-          # Check for shell execution without documentation
-          if grep -qE '(exec|system|subprocess|shell\.run|Bash tool)' "$SKILL_DIR"/**/*.{md} 2>/dev/null; then
-            if grep -q 'shell_access:' "$SKILL_FILE" 2>/dev/null; then
-              SCORE=$((SCORE - 5))
-              FINDINGS="$FINDINGS\n- [LOW] Shell execution present (documented)"
-            else
-              SCORE=$((SCORE - 15))
-              FINDINGS="$FINDINGS\n- [MEDIUM] Shell execution referenced, not documented in frontmatter"
-            fi
-          fi
-
-          # Check for obfuscated content
-          if grep -qE '(base64|atob|btoa|eval\(|exec\()' "$SKILL_DIR"/**/*.{sh,js,ts,py} 2>/dev/null; then
-            SCORE=$((SCORE - 30))
-            FINDINGS="$FINDINGS\n- [HIGH] Obfuscated or eval'd code detected"
-          fi
-
-          # Check for destructive operations without safeguards
-          if grep -qE '(rm -rf|rmdir|DROP TABLE|DELETE FROM|format|mkfs)' "$SKILL_DIR"/**/*.{sh,md} 2>/dev/null; then
-            if grep -q 'destructive:' "$SKILL_FILE" 2>/dev/null; then
-              SCORE=$((SCORE - 10))
-              FINDINGS="$FINDINGS\n- [MEDIUM] Destructive operations present (documented)"
-            else
-              SCORE=$((SCORE - 30))
-              FINDINGS="$FINDINGS\n- [HIGH] Undocumented destructive operations detected"
-            fi
-          fi
-
-          # Floor at 0
-          [ $SCORE -lt 0 ] && SCORE=0
-
-          # Assign grade
-          if [ $SCORE -ge 80 ]; then GRADE="A"
-          elif [ $SCORE -ge 65 ]; then GRADE="B"
-          elif [ $SCORE -ge 50 ]; then GRADE="C"
-          elif [ $SCORE -ge 35 ]; then GRADE="D"
-          else GRADE="F"
-          fi
-
-          echo "score=$SCORE"
-          echo "grade=$GRADE"
-          if [ -n "$FINDINGS" ]; then
-            echo "findings=$FINDINGS"
-          else
-            echo "findings=No issues found."
-          fi
-          SCANNER
-          chmod +x /tmp/skill-shield-scan.sh
-
       - name: Run skill-shield on changed skills
         if: steps.changed-skills.outputs.skills != ''
         id: scan-results
         run: |
           SKILLS="${{ steps.changed-skills.outputs.skills }}"
+          SCANNER="skills/skill-shield/scripts/scan.mjs"
           REPORT=""
           OVERALL_PASS=true
           LOWEST_SCORE=100
 
           for SKILL_DIR in $SKILLS; do
             SKILL_NAME=$(basename "$SKILL_DIR")
-            echo "Scanning: $SKILL_DIR"
+            echo "::group::Scanning $SKILL_NAME"
 
-            OUTPUT=$(/tmp/skill-shield-scan.sh "$SKILL_DIR" 2>&1)
-            SCORE=$(echo "$OUTPUT" | grep '^score=' | cut -d= -f2)
-            GRADE=$(echo "$OUTPUT" | grep '^grade=' | cut -d= -f2)
-            FINDINGS=$(echo "$OUTPUT" | grep '^findings=' | cut -d= -f2-)
+            JSON=$(node "$SCANNER" "$SKILL_DIR" 2>&1)
+            SCORE=$(echo "$JSON" | jq -r '.trustScore')
+            GRADE=$(echo "$JSON" | jq -r '.grade')
+            LABEL=$(echo "$JSON" | jq -r '.gradeLabel')
+            TOTAL=$(echo "$JSON" | jq -r '.summary.totalFindings')
+            CRITICAL=$(echo "$JSON" | jq -r '.summary.critical')
+            HIGH=$(echo "$JSON" | jq -r '.summary.high')
+            MEDIUM=$(echo "$JSON" | jq -r '.summary.medium')
+
+            echo "Score: $SCORE/100 Grade: $GRADE ($LABEL)"
+            echo "Findings: $TOTAL (critical: $CRITICAL, high: $HIGH, medium: $MEDIUM)"
+
+            # Build findings list
+            FINDINGS_LIST=""
+            FINDING_COUNT=$(echo "$JSON" | jq '.findings | length')
+            for i in $(seq 0 $((FINDING_COUNT - 1))); do
+              SEV=$(echo "$JSON" | jq -r ".findings[$i].severity" | tr '[:lower:]' '[:upper:]')
+              PAT=$(echo "$JSON" | jq -r ".findings[$i].pattern")
+              FILE=$(echo "$JSON" | jq -r ".findings[$i].file")
+              LINE=$(echo "$JSON" | jq -r ".findings[$i].line")
+              DESC=$(echo "$JSON" | jq -r ".findings[$i].description")
+              FINDINGS_LIST="${FINDINGS_LIST}
+- **[$SEV]** \`$PAT\` — $FILE:$LINE — $DESC"
+            done
+
+            if [ -z "$FINDINGS_LIST" ]; then
+              FINDINGS_LIST="No issues found."
+            fi
 
             # Track lowest score
-            if [ -n "$SCORE" ] && [ "$SCORE" -lt "$LOWEST_SCORE" ]; then
+            if [ "$SCORE" -lt "$LOWEST_SCORE" ]; then
               LOWEST_SCORE=$SCORE
             fi
 
-            # Determine pass/fail (< 50 = fail)
-            if [ -z "$SCORE" ] || [ "$SCORE" -lt 50 ]; then
+            # Determine pass/fail
+            if [ "$SCORE" -lt 50 ]; then
               OVERALL_PASS=false
               STATUS="BLOCKED"
               BADGE="🔴"
-            elif [ "$SCORE" -lt 65 ]; then
+            elif [ "$SCORE" -lt 75 ]; then
               STATUS="CAUTION"
               BADGE="🟡"
             else
@@ -190,18 +119,21 @@ jobs:
             fi
 
             REPORT="$REPORT
-          ### $BADGE \`$SKILL_NAME\` — Grade $GRADE ($SCORE/100)
+### $BADGE \`$SKILL_NAME\` — Grade $GRADE ($SCORE/100) — $LABEL
 
-          **Status**: $STATUS
+**Status**: $STATUS
 
-          **Findings**:
-          $FINDINGS
+**Findings** ($TOTAL total: $CRITICAL critical, $HIGH high, $MEDIUM medium):
+$FINDINGS_LIST
 
-          ---"
+---"
+            echo "::endgroup::"
           done
 
-          # Write report to file for next step
-          echo "$REPORT" > /tmp/scan-report.txt
+          # Write report for next step
+          cat > /tmp/scan-report.txt << REPORTEOF
+$REPORT
+REPORTEOF
           echo "overall_pass=$OVERALL_PASS" >> $GITHUB_OUTPUT
           echo "lowest_score=$LOWEST_SCORE" >> $GITHUB_OUTPUT
 
@@ -221,19 +153,10 @@ jobs:
 
             const summary = overallPass
               ? `All changed skills passed the security gate (lowest score: ${lowestScore}/100).`
-              : `One or more skills scored below 50/100 (grade D or F). Merge is blocked until issues are resolved. See [CONTRIBUTING.md](../CONTRIBUTING.md) for how to document legitimate patterns.`;
+              : `One or more skills scored below 50/100 (grade D or F). Merge is blocked until issues are resolved.`;
 
-            const body = `${header}
+            const body = `${header}\n\n${summary}\n\n---\n\n${report}\n\n<sub>Scanned by <a href="https://github.com/highimpact-dev/skill-shield">skill-shield</a></sub>`;
 
-            ${summary}
-
-            ---
-
-            ${report}
-
-            <sub>Scanned by [skill-shield](https://github.com/your-org/shielded-skills) · [How scoring works](../CONTRIBUTING.md#how-scoring-works)</sub>`;
-
-            // Find existing comment to update, or create new
             const { data: comments } = await github.rest.issues.listComments({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -265,7 +188,6 @@ jobs:
         uses: actions/github-script@v7
         with:
           script: |
-            // Ensure label exists
             try {
               await github.rest.issues.createLabel({
                 owner: context.repo.owner,
@@ -274,9 +196,7 @@ jobs:
                 color: '0e8a16',
                 description: 'All skills in this PR passed the skill-shield security scan',
               });
-            } catch (e) {
-              // Label already exists, that's fine
-            }
+            } catch (e) {}
 
             await github.rest.issues.addLabels({
               owner: context.repo.owner,
@@ -297,14 +217,12 @@ jobs:
                 issue_number: context.issue.number,
                 name: 'shield-verified',
               });
-            } catch (e) {
-              // Label wasn't there, that's fine
-            }
+            } catch (e) {}
 
       - name: Fail if trust score below gate
         if: steps.changed-skills.outputs.skills != '' && steps.scan-results.outputs.overall_pass == 'false'
         run: |
-          echo "One or more skills scored below the merge gate (50/100)."
+          echo "❌ One or more skills scored below the merge gate (50/100)."
           echo "Fix the flagged patterns or document legitimate use in your SKILL.md frontmatter."
           echo "See CONTRIBUTING.md for guidance."
           exit 1
