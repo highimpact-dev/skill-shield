@@ -1,0 +1,6 @@
+{
+  "name": "shielded-skills",
+  "description": "Security-verified agent skills marketplace. Every skill scanned for prompt injection, data exfiltration, and destructive operations.",
+  "version": "1.0.0",
+  "plugins": []
+}
