@@ -131,9 +131,7 @@ $FINDINGS_LIST
           done
 
           # Write report for next step
-          cat > /tmp/scan-report.txt << REPORTEOF
-$REPORT
-REPORTEOF
+          echo "$REPORT" > /tmp/scan-report.txt
           echo "overall_pass=$OVERALL_PASS" >> $GITHUB_OUTPUT
           echo "lowest_score=$LOWEST_SCORE" >> $GITHUB_OUTPUT
 
