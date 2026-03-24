@@ -29,7 +29,13 @@ jobs:
       - name: Detect changed skills
         id: detect
         run: |
-          DIRS=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- 'skills/' 'marketplace/skills/' | \
+          echo "Base: origin/${{ github.base_ref }}"
+          echo "HEAD: $(git rev-parse HEAD)"
+          echo "All changed files:"
+          git diff --name-only origin/${{ github.base_ref }}...HEAD || true
+          echo "---"
+          DIRS=$(git diff --name-only origin/${{ github.base_ref }}...HEAD | \
+            grep -E '^(skills/|marketplace/skills/)' | \
             sed -E 's|^(marketplace/skills/[^/]+|skills/[^/]+)/.*|\1|' | sort -u | tr '\n' ' ')
           echo "dirs=$DIRS" >> "$GITHUB_OUTPUT"
           echo "Found: $DIRS"
