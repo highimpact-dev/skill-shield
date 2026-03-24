@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'skills/**'
+      - 'marketplace/skills/**'
 
 permissions:
   contents: read
@@ -29,11 +30,23 @@ jobs:
       - name: Get changed skill directories
         id: changed-skills
         run: |
-          # Get list of changed files in skills/
-          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- 'skills/**' | \
-            grep '^skills/' | \
+          # Get list of changed files in skills/ and marketplace/skills/
+          CHANGED=$(git diff --name-only origin/${{ github.base_ref }}...HEAD -- 'skills/**' 'marketplace/skills/**' | \
+            grep -E '^(skills/|marketplace/skills/)' | \
+            sed 's|^marketplace/||' | \
             awk -F/ '{print $1"/"$2}' | \
             sort -u)
+
+          # Re-add marketplace/ prefix for dirs that came from there
+          RESOLVED=""
+          for dir in $CHANGED; do
+            if [ -d "$dir" ]; then
+              RESOLVED="$RESOLVED $dir"
+            elif [ -d "marketplace/$dir" ]; then
+              RESOLVED="$RESOLVED marketplace/$dir"
+            fi
+          done
+          CHANGED="$RESOLVED"
 
           if [ -z "$CHANGED" ]; then
             echo "No skill directories changed."
